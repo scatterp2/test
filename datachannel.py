@@ -1,5 +1,6 @@
 import random
 import math
+import lzma
 from enum import Enum
 from typing import Tuple, List, Optional, Dict
 from dataclasses import dataclass
@@ -111,6 +112,21 @@ def generate_target(data_digits=12):
     data = "".join(str(random.randint(0, 9)) for _ in range(data_digits))
     crc = make_crc(data)
     return int(data + crc)
+
+
+def compress_data(data_bytes: bytes) -> Tuple[bytes, float]:
+    """
+    Compress data using LZMA (xz) compression.
+    Returns (compressed_data, compression_ratio).
+    """
+    compressed = lzma.compress(data_bytes, preset=6)  # preset=6 gives good balance
+    ratio = len(compressed) / len(data_bytes) if len(data_bytes) > 0 else 1.0
+    return compressed, ratio
+
+
+def decompress_data(compressed_bytes: bytes) -> bytes:
+    """Decompress LZMA-compressed data."""
+    return lzma.decompress(compressed_bytes)
 
 
 def encode_small_event(data_int: int) -> Tuple[List[int], int]:
@@ -300,20 +316,47 @@ def print_table(all_rows, target):
         )
 
 
-def run_system(data_digits=12):
+def run_system(data_digits=12, use_compression=True):
     """
-    Main system entry point with regime-aware encoding.
+    Main system entry point with regime-aware encoding and optional XZ compression.
     Selects encoding strategy based on data size and tracks efficiency metrics.
     """
     target = generate_target(data_digits)
     target_str = str(target)
     # Calculate raw binary bytes needed: ceil(bits / 8) where bits = digits * log2(10)
-    target_bytes = math.ceil(len(target_str) * math.log2(10) / 8)
+    original_bytes = math.ceil(len(target_str) * math.log2(10) / 8)
     
-    # Determine encoding regime
-    regime = determine_regime(target_bytes)
+    # Convert target to bytes for compression
+    target_bytes_raw = target_str.encode('utf-8')
     
-    print(f"\nTARGET (WITH CRC): {target} bytes={target_bytes}")
+    # Apply compression if enabled and data is large enough
+    compressed_bytes = None
+    comp_ratio = None
+    if use_compression and len(target_bytes_raw) > SMALL_THRESHOLD:
+        compressed_bytes, comp_ratio = compress_data(target_bytes_raw)
+        print(f"\n{'='*60}")
+        print(f"COMPRESSION STATISTICS")
+        print(f"{'='*60}")
+        print(f"Original size: {len(target_bytes_raw)} bytes")
+        print(f"Compressed size: {len(compressed_bytes)} bytes")
+        print(f"Compression ratio: {comp_ratio:.2%} ({(1-comp_ratio)*100:.1f}% reduction)")
+        print(f"{'='*60}\n")
+        
+        # Use compressed data for transfer - convert back to integer for processing
+        transfer_target = int.from_bytes(compressed_bytes, byteorder='big')
+        effective_bytes = len(compressed_bytes)
+    else:
+        transfer_target = target
+        effective_bytes = original_bytes
+        if use_compression:
+            print(f"\nSkipping compression for small data ({original_bytes} bytes < threshold)\n")
+    
+    # Determine encoding regime based on effective size
+    regime = determine_regime(effective_bytes)
+    
+    print(f"\nTARGET (WITH CRC): {target} bytes={original_bytes}")
+    if use_compression and compressed_bytes:
+        print(f"AFTER COMPRESSION: {len(compressed_bytes)} bytes ({comp_ratio:.1%} of original)")
     print(f"REGIME: {regime.value.upper()}\n")
     
     all_rows = []
@@ -323,7 +366,7 @@ def run_system(data_digits=12):
     
     if regime == Regime.SMALL:
         # SMALL: Direct event encoding, no M×t dynamics
-        events, time_cost = encode_small_event(target)
+        events, time_cost = encode_small_event(transfer_target)
         total_time = time_cost
         
         print(f"Small regime: direct event encoding")
@@ -336,7 +379,7 @@ def run_system(data_digits=12):
         
     elif regime == Regime.MEDIUM:
         # MEDIUM: Iterative convergence with phase switching
-        all_rows, final_residual, total_time = encode_medium_iterative(target)
+        all_rows, final_residual, total_time = encode_medium_iterative(transfer_target)
         
         # Extract phase data for reconstruction
         for row in all_rows:
@@ -374,7 +417,7 @@ def run_system(data_digits=12):
         
     else:  # LARGE
         # LARGE: Compositional medium chunks
-        chunk_results, total_time = encode_large_compositional(target)
+        chunk_results, total_time = encode_large_compositional(transfer_target)
         
         print(f"Large regime: compositional encoding with {len(chunk_results)} chunks")
         
@@ -386,17 +429,20 @@ def run_system(data_digits=12):
         
         # For large data, reconstruction happens per chunk
         # This is a simplified version - full implementation would combine chunks
-        result = target  # Placeholder
+        result = transfer_target  # Placeholder
     
     print(f"\nTotal time: {total_time}")
     
     # Calculate throughput: bytes per time unit
+    # Use effective_bytes (after compression) for accurate throughput calculation
     if total_time > 0:
-        bytes_per_second = target_bytes / total_time
-        print(f"Total bytes transferred: {target_bytes}")
+        bytes_per_second = effective_bytes / total_time
+        print(f"Total bytes transferred: {effective_bytes}" + 
+              (f" (compressed from {original_bytes})" if compressed_bytes else ""))
         print(f"Throughput: {bytes_per_second:.6f} bytes/time_unit")
     else:
-        print(f"Total bytes transferred: {target_bytes}")
+        print(f"Total bytes transferred: {effective_bytes}" +
+              (f" (compressed from {original_bytes})" if compressed_bytes else ""))
         print("Throughput: N/A (zero time)")
     
     return result
@@ -411,8 +457,19 @@ if __name__ == "__main__":
     except AttributeError:
         pass  # Older Python versions don't have this limit
     
+    use_compression = True
+    data_digits = 12
+    
     if len(sys.argv) > 1:
         arg = sys.argv[1]
+        # Check for compression flag
+        if arg in ['--no-compress', '--no-compression', '-nc']:
+            use_compression = False
+            if len(sys.argv) > 2:
+                arg = sys.argv[2]
+            else:
+                arg = '12'
+        
         # Support various input formats
         if arg.endswith('KB'):
             # Convert KB to approximate data digits
@@ -434,6 +491,5 @@ if __name__ == "__main__":
         else:
             # Assume it's a raw digit count
             data_digits = int(arg)
-        run_system(data_digits=data_digits)
-    else:
-        run_system(data_digits=12)
+    
+    run_system(data_digits=data_digits, use_compression=use_compression)
